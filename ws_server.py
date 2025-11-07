@@ -1,426 +1,289 @@
-# ws_server.py — Twilio TwiML + recording webhook + hold loop + REALTIME STREAM (FastAPI)
+# ws_server.py — Exotel-only Realtime Voice Bot (FastAPI + OpenAI Realtime, PCM16)
+# ------------------------------------------------------------------------------
+# What it does:
+# - WebSocket endpoint /exotel-media that Exotel Voicebot Applet connects to
+# - Streams caller audio (PCM16) to OpenAI Realtime
+# - Streams OpenAI audio (PCM16) back to caller in real time
+# - Accumulates ~120ms of audio before each commit to satisfy Realtime API
+# - Forces English responses
+#
+# How to wire in Exotel:
+# - Create a Voicebot (bidirectional) applet, set URL to wss://<your-host>/exotel-media
+#   OR set it to https://<your-host>/exotel-ws-bootstrap (this returns {"url":"wss://.../exotel-media"})
+#
+# Env required:
+# - One of: OPENAI_KEY / OpenAI_Key / OPENAI_API_KEY
+# - PUBLIC_BASE_URL (for /exotel-ws-bootstrap convenience)
+#
+# Dependencies:
+#   pip install fastapi uvicorn aiohttp python-dotenv
+#
+# Run locally:
+#   uvicorn ws_server:app --host 0.0.0.0 --port 10000
 
 import os
 import asyncio
 import json
 import logging
-import time
-import urllib.parse
-from typing import Optional, Dict
-
-from fastapi import FastAPI, Request, Form, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, PlainTextResponse
-from twilio.twiml.voice_response import VoiceResponse
 import base64
+from typing import Optional
 
-logging.basicConfig(level=logging.INFO)
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
+from aiohttp import ClientSession, WSMsgType
+
+# ---------- Logging ----------
+level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, level, logging.INFO))
 logger = logging.getLogger("ws_server")
 
-# -------- Env / Config --------
+# ---------- Env ----------
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # optional for local dev
     load_dotenv()
 except Exception:
     pass
 
-# Prefer your key name, fallback to standard
-OPENAI_API_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = (
+    os.getenv("OPENAI_KEY")
+    or os.getenv("OpenAI_Key")
+    or os.getenv("OPENAI_API_KEY")
+)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Optional (kept from your file, still usable by legacy flow)
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-ELEVEN_VOICE = os.getenv("ELEVEN_VOICE", "Xb7hH8MSUJpSbSDYk0k2")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.getenv("TWILIO_FROM", "+15312303465")
-
 if not OPENAI_API_KEY:
-    logger.warning("No OpenAI key found. Set OpenAI_Key or OPENAI_API_KEY.")
+    logger.warning("No OpenAI key found. Set OPENAI_KEY or OpenAI_Key or OPENAI_API_KEY.")
 if not PUBLIC_BASE_URL:
-    logger.warning("PUBLIC_BASE_URL is not set; realtime Twilio <Stream> will fail.")
+    logger.info("PUBLIC_BASE_URL not set (only needed for /exotel-ws-bootstrap).")
 
-def _has_openai_key() -> bool:
-    """Runtime check used by endpoints (startup warning above is not enough)."""
-    return bool(os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY"))
-
-def _ws_host_from_public_base() -> Optional[str]:
-    """Render-safe: always derive WS host from PUBLIC_BASE_URL, not request.host."""
-    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    if not base:
-        return None
-    return base.replace("https://", "").replace("http://", "")
-
+# ---------- FastAPI ----------
 app = FastAPI()
 
-# ----------- Legacy turn-based state (kept from your flow) -----------
-_state: Dict[str, Dict] = {}
-_state_lock = asyncio.Lock()
-
-MIN_DURATION_SECONDS = 2
-RECORDING_COOLDOWN_SECONDS = 2.0
-
-async def should_ignore_recording(call_sid: str, rec_sid: Optional[str], rec_duration: Optional[str]) -> bool:
-    now = time.time()
-    async with _state_lock:
-        st = _state.get(call_sid, {"last_rec_sid": None, "last_at": 0.0, "turn": 0})
-        if rec_duration is not None:
-            try:
-                if int(rec_duration) < MIN_DURATION_SECONDS:
-                    logger.info("[%s] ignore: too short (%ss)", call_sid, rec_duration)
-                    return True
-            except Exception:
-                pass
-        if rec_sid and st.get("last_rec_sid") == rec_sid:
-            logger.info("[%s] ignore: duplicate RecordingSid=%s", call_sid, rec_sid)
-            return True
-        if now - float(st.get("last_at", 0.0)) < RECORDING_COOLDOWN_SECONDS:
-            logger.info("[%s] ignore: cooldown not elapsed", call_sid)
-            return True
-        if rec_sid:
-            st["last_rec_sid"] = rec_sid
-        st["last_at"] = now
-        _state[call_sid] = st
-        return False
-
-def twiml(resp: VoiceResponse) -> Response:
-    return Response(content=str(resp), media_type="text/xml")
-
-def recording_callback_url(request: Request) -> str:
-    return f"{str(request.base_url).rstrip('/')}/recording"
-
-_hold: Dict[str, Dict] = {}
-_hold_lock = asyncio.Lock()
-
-# -------------------- Health / Root --------------------
-@app.get("/")
-async def root():
-    return PlainTextResponse(
-        "ok: /twiml (turn-based), /twiml_stream (realtime), /health",
-        status_code=200
-    )
-
+# ---------- Health / Diag ----------
 @app.get("/health")
 async def health():
     return PlainTextResponse("ok", status_code=200)
 
-# -------------------- Legacy turn-based TwiML --------------------
-@app.get("/twiml")
-@app.post("/twiml")
-async def twiml_entry(request: Request):
-    try:
-        vr = VoiceResponse()
-        vr.say("Hello! Please leave your message after the beep.", voice="alice")
-        vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
-        return twiml(vr)
-    except Exception as e:
-        logger.exception("twiml_entry error: %s", e)
-        vr = VoiceResponse()
-        vr.say("An application error has occurred. Goodbye.", voice="alice")
-        vr.hangup()
-        return twiml(vr)
+@app.get("/diag")
+async def diag():
+    return {
+        "openai_key_present": bool(OPENAI_API_KEY),
+        "public_base_url_set": bool(PUBLIC_BASE_URL),
+    }
 
-@app.options("/recording")
-async def recording_options():
-    return PlainTextResponse("", status_code=200)
+# ---------- Exotel WS bootstrap ----------
+# If you prefer to give Exotel an HTTPS endpoint that returns the WS URL:
+@app.get("/exotel-ws-bootstrap")
+async def exotel_ws_bootstrap():
+    if not PUBLIC_BASE_URL:
+        return JSONResponse({"error": "PUBLIC_BASE_URL not configured"}, status_code=500)
+    return {"url": f"wss://{PUBLIC_BASE_URL.split('://')[-1]}/exotel-media"}
 
-@app.post("/recording")
-@app.get("/recording")
-async def recording_webhook(
-    request: Request,
-    CallSid: Optional[str] = Form(None),
-    From: Optional[str] = Form(None),
-    RecordingUrl: Optional[str] = Form(None),
-    RecordingSid: Optional[str] = Form(None),
-    RecordingDuration: Optional[str] = Form(None),
-    q_CallSid: Optional[str] = Query(None, alias="CallSid"),
-    q_From: Optional[str] = Query(None, alias="From"),
-    q_RecordingUrl: Optional[str] = Query(None, alias="RecordingUrl"),
-    q_RecordingSid: Optional[str] = Query(None, alias="RecordingSid"),
-    q_RecordingDuration: Optional[str] = Query(None, alias="RecordingDuration"),
-):
-    call_sid = CallSid or q_CallSid
-    from_num = From or q_From
-    rec_url  = RecordingUrl or q_RecordingUrl
-    rec_sid  = RecordingSid or q_RecordingSid
-    rec_dur  = RecordingDuration or q_RecordingDuration
+# ======================================================================
+# ===============  EXOTEL BIDIRECTIONAL WS HANDLER  ====================
+# ======================================================================
+# Exotel will send JSON events:
+#   "connected" (optional)
+#   "start"  { start: { stream_sid, media_format: { encoding, sample_rate, bit_rate } } }
+#   "media"  { media: { payload: "<base64 of PCM16 mono>" } }
+#   "dtmf"   ...
+#   "stop"
+#
+# We reply with:
+#   {"event":"media","stream_sid": "...", "media":{"payload":"<base64 PCM16>"}}
+#
+# OpenAI Realtime expects:
+#   session.update: input/output audio format strings ("pcm16")
+#   input_audio_buffer.append: { audio: "<base64 PCM16>" }
+#   input_audio_buffer.commit  (after >= ~100ms buffered)
+#   response.create            (modalities ["text","audio"])
+#
+# Notes:
+# - We accumulate ~120ms of audio (commit_target) based on incoming sample_rate.
+# - Optional "hard barge-in" is included (commented out). Enable if you want to force-cut current speech.
 
-    if not call_sid or not rec_url:
-        vr = VoiceResponse()
-        vr.say("We did not get your message. Please try again.", voice="alice")
-        vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
-        return twiml(vr)
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
-    if await should_ignore_recording(call_sid, rec_sid, rec_dur):
-        vr = VoiceResponse()
-        vr.pause(length=1)
-        vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
-        return twiml(vr)
-
-    asyncio.create_task(process_recording_background(call_sid, rec_url, from_num))
-
-    vr = VoiceResponse()
-    vr.say("Got it. Please hold while I prepare your response.", voice="alice")
-    hold_url = f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(call_sid)}"
-    vr.redirect(hold_url)
-    return twiml(vr)
-
-@app.post("/_test_set_hold")
-async def test_set_hold(convo_id: str = Query(...), reply_text: str = Query("Hello from test"), tts_url: Optional[str] = Query(None)):
-    async with _hold_lock:
-        _hold[convo_id] = {"reply_text": reply_text, "tts_url": tts_url}
-    return {"ok": True, "convo_id": convo_id, "payload": _hold[convo_id]}
-
-@app.get("/hold")
-async def hold(request: Request, convo_id: str = Query(...)):
-    try:
-        async with _hold_lock:
-            payload = _hold.pop(convo_id, None)
-
-        if payload:
-            reply_text = payload.get("reply_text") or "Here is your reply."
-            tts_url = payload.get("tts_url")
-            async with _state_lock:
-                st = _state.get(convo_id, {"turn": 0, "last_at": time.time()})
-                st["turn"] = int(st.get("turn", 0)) + 1
-                st["last_at"] = time.time()
-                _state[convo_id] = st
-
-            vr = VoiceResponse()
-            if tts_url:
-                vr.play(tts_url)
-            else:
-                vr.say(reply_text, voice="alice")
-            vr.record(max_length=30, play_beep=True, timeout=3, action=recording_callback_url(request))
-            return twiml(vr)
-
-        vr = VoiceResponse()
-        vr.pause(length=2)
-        vr.redirect(f"{str(request.base_url).rstrip('/')}/hold?convo_id={urllib.parse.quote_plus(convo_id)}")
-        return twiml(vr)
-    except Exception as e:
-        logger.exception("Hold error: %s", e)
-        vr = VoiceResponse()
-        vr.say("An error occurred.", voice="alice")
-        return twiml(vr)
-
-# ----------- Background (legacy) stub kept -----------
-import re, requests
-from requests.auth import HTTPBasicAuth
-_TWILIO_REC_RE = re.compile(r"https://api\.twilio\.com/2010-04-01/Accounts/[^/]+/Recordings/(RE[a-zA-Z0-9]+)(?:\.(mp3|wav))?$")
-
-def build_download_url(url: str) -> str:
-    m = _TWILIO_REC_RE.match(url)
-    if m and not m.group(2):
-        return f"{url}.mp3"
-    return url
-
-def download_bytes_with_retry(url: str, auth=None, timeout=20, attempts=3, backoff=0.6, min_size_bytes: int = 1024) -> bytes:
-    last_exc = None
-    for i in range(1, attempts + 1):
-        try:
-            r = requests.get(url, auth=auth, timeout=timeout, allow_redirects=True)
-            r.raise_for_status()
-            if len(r.content) < min_size_bytes:
-                raise RuntimeError("Downloaded content too small")
-            return r.content
-        except Exception as e:
-            last_exc = e
-            time.sleep(backoff * i)
-    raise last_exc or RuntimeError("download failed")
-
-async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
-    # Keep your old transcription + reply + (optional TTS to S3) implementation if you still use the legacy route
-    pass
-
-# =======================================================================
-# ===============  REALTIME STREAMING WITH BARGE-IN  ====================
-# =======================================================================
-
-from aiohttp import ClientSession, WSMsgType
-
-@app.post("/twiml_stream")
-@app.get("/twiml_stream")
-async def twiml_stream(request: Request):
-    vr = VoiceResponse()
-
-    # Hard fail (speak + hang up) if config is missing, to avoid “welcome then drop”.
-    if not _has_openai_key():
-        logger.error("Realtime requested but no OpenAI key set. Set OpenAI_Key or OPENAI_API_KEY.")
-        vr.say("Configuration error. Open A I key is missing. Please try again later.", voice="alice")
-        vr.hangup()
-        return twiml(vr)
-
-    ws_host = _ws_host_from_public_base()
-    if not ws_host:
-        logger.error("Realtime requested but PUBLIC_BASE_URL is not set.")
-        vr.say("Configuration error. Public base URL is not set. Goodbye.", voice="alice")
-        vr.hangup()
-        return twiml(vr)
-
-    vr.say("You are connected to the real time assistant.", voice="alice")
-    # Always use PUBLIC_BASE_URL host for Twilio <Stream> (Render-friendly)
-    vr.connect().stream(url=f"wss://{ws_host}/twilio-media")
-    return twiml(vr)
-
-# How much audio to accumulate before committing (in bytes)
-# ~120 ms @ 8kHz mulaw = 0.12 * 8000 * 1 = 960 bytes
-COMMIT_BYTES_TARGET = 960
-
-# Track per-stream state
-stream_state: Dict[str, Dict[str, int]] = {}  # {stream_sid: {"accum_bytes": int}}
-
-@app.websocket("/twilio-media")
-async def twilio_media_ws(ws: WebSocket):
+@app.websocket("/exotel-media")
+async def exotel_media_ws(ws: WebSocket):
     await ws.accept()
-    call_info = {"stream_sid": None}
-    logger.info("Twilio WS connected")
+    logger.info("Exotel WS connected")
 
-    # OpenAI Realtime WS client session
+    if not OPENAI_API_KEY:
+        logger.error("No OPENAI_API_KEY; closing Exotel stream.")
+        await ws.close()
+        return
+
+    # Stream state
+    stream_sid: Optional[str] = None
+    sample_rate: int = 8000  # default; will be updated from "start"
+    bytes_per_sample: int = 2  # PCM16 mono
+    commit_target: int = int(sample_rate * bytes_per_sample * 0.12)  # ~120ms
+    accum_bytes: int = 0
+    speaking: bool = False  # for optional hard barge-in
+
+    openai_session: Optional[ClientSession] = None
     openai_ws = None
-    openai_task = None
+    openai_reader_task: Optional[asyncio.Task] = None
 
-    async def openai_connect_and_pump():
-        nonlocal openai_ws
-        if not OPENAI_API_KEY:
-            logger.error("OPENAI_API_KEY not set — aborting realtime session.")
-            return
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-        # Update model string as needed to the newest realtime-preview
-        url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
-        async with ClientSession() as session:
-            async with session.ws_connect(url, headers=headers) as ows:
-                openai_ws = ows
+    async def openai_connect():
+        """Open the Realtime WS to OpenAI and configure the session for PCM16 + English."""
+        nonlocal openai_session, openai_ws, openai_reader_task, speaking
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+        url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-                # Configure session audio formats to match Twilio (μ-law 8k)
-                await ows.send_json({
-                    "type": "session.update",
-                    "session": {
-                        "input_audio_format": "g711_ulaw",
-                        "output_audio_format": "g711_ulaw",
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 200,
-                            "silence_duration_ms": 600
-                        },
-                        "voice": "verse",
-                        "instructions": (
-                              "You are a concise helpful voice agent. "
-                              "Always respond in English (Indian English). "
-                              "If the caller speaks another language, reply in English and keep answers short."
-                            ),
-                    }
-                })
+        openai_session = ClientSession()
+        openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-                # Pump OpenAI -> Twilio
-                async for msg in ows:
+        # Configure session once (PCM16 both ways, English-only instructions)
+        await openai_ws.send_json({
+            "type": "session.update",
+            "session": {
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 600
+                },
+                "voice": "verse",
+                "instructions": (
+                    "You are a concise helpful voice agent. "
+                    "Always respond in English (Indian English). Keep answers short."
+                ),
+            }
+        })
+
+        # Start a background task to forward OpenAI audio deltas back to Exotel
+        async def pump_openai_to_exotel():
+            nonlocal speaking
+            try:
+                async for msg in openai_ws:
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
                         etype = evt.get("type")
-
                         if etype == "response.audio.delta":
                             chunk_b64 = evt.get("delta")
                             if chunk_b64 and ws.client_state.name != "DISCONNECTED":
-                                # Forward model audio to Twilio stream
+                                speaking = True
                                 await ws.send_text(json.dumps({
                                     "event": "media",
-                                    "streamSid": call_info.get("stream_sid"),
+                                    "stream_sid": stream_sid,
                                     "media": {"payload": chunk_b64}
                                 }))
-
                         elif etype == "response.completed":
-                            # One answer finished; next user audio will trigger new response
-                            pass
-
+                            speaking = False
                         elif etype == "error":
-                            logger.error("OpenAI error event: %s", evt)
+                            logger.error("OpenAI error: %s", evt)
                             break
-
-                    elif msg.type == WSMsgType.BINARY:
-                        # Not used
-                        pass
                     elif msg.type == WSMsgType.ERROR:
                         logger.error("OpenAI ws error")
                         break
+            except Exception as e:
+                logger.exception("OpenAI pump error: %s", e)
 
-    async def ensure_openai():
-        nonlocal openai_task
-        if openai_task is None or openai_task.done():
-            openai_task = asyncio.create_task(openai_connect_and_pump())
+        openai_reader_task = asyncio.create_task(pump_openai_to_exotel())
 
-    try:
-        await ensure_openai()
-
-        while True:
-            raw = await ws.receive_text()
-            frame = json.loads(raw)
-            event = frame.get("event")
-
-            if event == "start":
-                call_info["stream_sid"] = frame["start"]["streamSid"]
-                logger.info("Stream started: %s", call_info["stream_sid"])
-                stream_state[call_info["stream_sid"]] = {"accum_bytes": 0}
-
-            elif event == "media":
-                # Incoming μ-law 8k audio from Twilio (base64)
-                payload_b64 = frame["media"]["payload"]
-                if not payload_b64:
-                    # empty frame; ignore
-                    continue
-
-                await ensure_openai()
-                if openai_ws is not None and not openai_ws.closed:
-                    # Append audio & commit; model VAD will decide when to respond
-                    await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": payload_b64})
-
-                     # accumulate exact byte-count (base64-decoded length)
-                    try:
-                        raw_len = len(base64.b64decode(payload_b64))
-                    except Exception:
-                    # if decoding fails, fall back to an estimate (not typical)
-                        raw_len = 0
-
-                    sid = call_info.get("stream_sid") or "unknown"
-                    if sid not in stream_state:
-                        stream_state[sid] = {"accum_bytes": 0}
-                        stream_state[sid]["accum_bytes"] += raw_len
-                    if stream_state[sid]["accum_bytes"] >= COMMIT_BYTES_TARGET:    
-                        await openai_ws.send_json({"type": "input_audio_buffer.commit"})
-                        await openai_ws.send_json({"type": "response.create", "response": {"modalities": ["text", "audio"],"instructions": "Reply in English only. Keep it short."}})
-                        stream_state[sid]["accum_bytes"] = 0
-
-            elif event == "mark":
-                # Optional markers
-                pass
-
-            elif event == "stop":
-                logger.info("Stream stopped by Twilio.")
-                sid = call_info.get("stream_sid")
-                if sid and sid in stream_state:
-                    stream_state.pop(sid, None)
-                break
-            # --- Hard barge-in hook (optional) ---
-            # If you want to force-cut current speech on any new user audio:
-            # if event == "media" and openai_ws is not None and not openai_ws.closed:
-            #     await openai_ws.send_json({"type": "response.cancel"})
-
-    except WebSocketDisconnect:
-        logger.info("Twilio WS disconnected")
-    except Exception as e:
-        logger.exception("Twilio WS error: %s", e)
-    finally:
+    async def openai_close():
+        """Gracefully close OpenAI WS and session."""
         try:
-            if openai_task:
-                openai_task.cancel()
+            if openai_reader_task and not openai_reader_task.done():
+                openai_reader_task.cancel()
         except Exception:
             pass
+        try:
+            if openai_ws and not openai_ws.closed:
+                await openai_ws.close()
+        except Exception:
+            pass
+        try:
+            if openai_session:
+                await openai_session.close()
+        except Exception:
+            pass
+
+    # Connect to OpenAI once we have a client WS
+    await openai_connect()
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            evt = json.loads(raw)
+            etype = evt.get("event")
+
+            if etype == "connected":
+                # Optional first event
+                continue
+
+            if etype == "start":
+                # Exotel start event; also carries media_format
+                start_obj = evt.get("start", {})
+                stream_sid = start_obj.get("stream_sid") or start_obj.get("streamSid")
+                mf = start_obj.get("media_format") or {}
+                sr = int(mf.get("sample_rate") or sample_rate)
+                sample_rate = sr
+                commit_target = int(sample_rate * bytes_per_sample * 0.12)  # ~120ms buffer
+                accum_bytes = 0
+                logger.info("Exotel stream started sid=%s sr=%d commit_target=%d", stream_sid, sample_rate, commit_target)
+
+            elif etype == "media":
+                # Incoming PCM16 mono base64
+                media = evt.get("media") or {}
+                payload_b64 = media.get("payload")
+                if not payload_b64:
+                    continue
+
+                if openai_ws is None or openai_ws.closed:
+                    logger.warning("OpenAI WS not ready; skipping audio frame")
+                    continue
+
+                # OPTIONAL HARD BARGE-IN:
+                # If user speaks while bot is speaking, force-cancel current response
+                # if speaking:
+                #     await openai_ws.send_json({"type": "response.cancel"})
+                #     speaking = False
+
+                # Append audio to OpenAI input buffer
+                await openai_ws.send_json({
+                    "type": "input_audio_buffer.append",
+                    "audio": payload_b64
+                })
+
+                # Count bytes and commit when reaching ~120ms
+                try:
+                    raw_len = len(base64.b64decode(payload_b64))
+                except Exception:
+                    raw_len = 0
+                accum_bytes += raw_len
+
+                if accum_bytes >= commit_target:
+                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                    await openai_ws.send_json({
+                        "type": "response.create",
+                        "response": {
+                            "modalities": ["text", "audio"],
+                            "instructions": "Reply in English only. Keep it short."
+                        }
+                    })
+                    logger.debug("[%s] committed %d bytes; requested response", stream_sid, accum_bytes)
+                    accum_bytes = 0
+
+            elif etype == "dtmf":
+                # Optional: handle DTMF here if needed
+                pass
+
+            elif etype == "stop":
+                logger.info("Exotel stream stopped sid=%s", stream_sid)
+                break
+
+            # Ignore unknown events quietly
+    except WebSocketDisconnect:
+        logger.info("Exotel WS disconnected")
+    except Exception as e:
+        logger.exception("Exotel WS error: %s", e)
+    finally:
+        await openai_close()
         try:
             await ws.close()
         except Exception:
