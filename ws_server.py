@@ -57,6 +57,154 @@ if not PUBLIC_BASE_URL:
     logger.info("PUBLIC_BASE_URL not set (only needed for /exotel-ws-bootstrap).")
 
 # ---------- FastAPI ----------
+# ---- add to your imports ----
+import base64, asyncio, json, os, logging
+from typing import Optional
+from fastapi import WebSocket, WebSocketDisconnect
+from aiohttp import ClientSession, WSMsgType
+
+logger = logging.getLogger("ws_server")
+
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+
+# ---- add this new route ----
+@app.websocket("/browser-media")
+async def browser_media_ws(ws: WebSocket):
+    await ws.accept()
+    if not OPENAI_API_KEY:
+        logger.error("No OPENAI_API_KEY; closing /browser-media")
+        await ws.close(); return
+
+    stream_sr = 16000   # default; browser sends it in 'start'
+    bytes_per_sample = 2
+    commit_target = int(stream_sr * bytes_per_sample * 0.12)  # ~120ms
+    accum_bytes = 0
+    speaking = False
+
+    openai_session: Optional[ClientSession] = None
+    openai_ws = None
+
+    async def openai_connect():
+        nonlocal openai_session, openai_ws
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+        url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
+        openai_session = ClientSession()
+        openai_ws = await openai_session.ws_connect(url, headers=headers)
+        await openai_ws.send_json({
+            "type": "session.update",
+            "session": {
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 600
+                },
+                "voice": "verse",
+                "instructions": (
+                    "You are a concise helpful voice agent. "
+                    "Always respond in English (Indian English). Keep answers short."
+                ),
+            }
+        })
+
+    async def openai_close():
+        try:
+            if openai_ws and not openai_ws.closed:
+                await openai_ws.close()
+        except Exception:
+            pass
+        try:
+            if openai_session:
+                await openai_session.close()
+        except Exception:
+            pass
+
+    async def pump_openai_to_browser():
+        nonlocal speaking
+        try:
+            async for msg in openai_ws:
+                if msg.type == WSMsgType.TEXT:
+                    evt = msg.json()
+                    t = evt.get("type")
+                    if t == "response.audio.delta":
+                        speaking = True
+                        chunk_b64 = evt.get("delta")
+                        if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                            await ws.send_text(json.dumps({"event": "media", "audio": chunk_b64}))
+                    elif t == "response.completed":
+                        speaking = False
+                    elif t == "error":
+                        logger.error("OpenAI error: %s", evt); break
+                elif msg.type == WSMsgType.ERROR:
+                    logger.error("OpenAI ws error"); break
+        except Exception as e:
+            logger.exception("OpenAI pump error: %s", e)
+
+    await openai_connect()
+    pump_task = asyncio.create_task(pump_openai_to_browser())
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            m = json.loads(raw)
+            if m.get("event") == "start":
+                try:
+                    stream_sr = int(m.get("sample_rate") or 16000)
+                except Exception:
+                    stream_sr = 16000
+                commit_target = int(stream_sr * bytes_per_sample * 0.12)
+                accum_bytes = 0
+                logger.info("/browser-media start sr=%d target=%d", stream_sr, commit_target)
+
+            elif m.get("event") == "media":
+                b64 = m.get("audio")
+                if not b64 or openai_ws is None or openai_ws.closed:
+                    continue
+
+                # OPTIONAL hard barge-in
+                # if speaking:
+                #     await openai_ws.send_json({"type": "response.cancel"})
+                #     speaking = False
+
+                await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": b64})
+
+                try:
+                    raw_len = len(base64.b64decode(b64))
+                except Exception:
+                    raw_len = 0
+                accum_bytes += raw_len
+
+                if accum_bytes >= commit_target:
+                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                    await openai_ws.send_json({
+                        "type": "response.create",
+                        "response": {
+                            "modalities": ["text","audio"],
+                            "instructions": "Reply in English only. Keep it short."
+                        }
+                    })
+                    accum_bytes = 0
+            else:
+                # ignore unknown events
+                pass
+    except WebSocketDisconnect:
+        logger.info("/browser-media disconnected")
+    except Exception as e:
+        logger.exception("/browser-media error: %s", e)
+    finally:
+        try:
+            pump_task.cancel()
+        except Exception:
+            pass
+        await openai_close()
+        try:
+            await ws.close()
+        except Exception:
+            pass
+#------------------------------------------------------------------------
+
 app = FastAPI()
 
 # ---------- Health / Diag ----------
