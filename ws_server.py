@@ -36,7 +36,7 @@ from aiohttp import ClientSession, WSMsgType
 level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, level, logging.INFO))
 logger = logging.getLogger("ws_server")
-
+app = FastAPI()
 # ---------- Env ----------
 try:
     from dotenv import load_dotenv  # optional for local dev
@@ -205,7 +205,7 @@ async def browser_media_ws(ws: WebSocket):
             pass
 #------------------------------------------------------------------------
 
-app = FastAPI()
+
 
 # ---------- Health / Diag ----------
 @app.get("/health")
