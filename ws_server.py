@@ -79,17 +79,47 @@ async def browser_media_ws(ws: WebSocket):
         return
 
     # ---- stream state ----
-    sr = 16000                     # browser tells us on "start"
-    BYTES_PER_SAMPLE = 2           # PCM16 mono
-    target = int(sr * BYTES_PER_SAMPLE * 0.12)  # ~120ms
-    accum = 0
-    real_frames = 0                # number of non-zero frames in current window
-    pending = False                # we asked for a response and are waiting
-    speaking = False               # model is currently speaking
+    sr = 16000                    # browser announces in first "start"
+    BYTES_PER_SAMPLE = 2          # PCM16 mono
+    target = int(sr * BYTES_PER_SAMPLE * 0.12)   # ~120ms
+    accum = 0                     # bytes accumulated since last commit
+    real_frames = 0               # count of non-zero frames
+    pending = False               # waiting on an OpenAI response
+    speaking = False              # model is currently speaking
 
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
+
+    async def safe_send_json(payload: dict):
+        """
+        Always use this instead of openai_ws.send_json.
+        It logs the type and blocks empty commits by checking our local buffer state.
+        """
+        nonlocal accum, real_frames, pending
+        t = payload.get("type")
+        if t == "input_audio_buffer.commit":
+            # HARD GUARD: never allow an empty commit out
+            if real_frames < 1 or accum <= 0:
+                logger.debug(
+                    "BLOCKED commit: accum=%d real_frames=%d pending=%s",
+                    accum, real_frames, pending
+                )
+                return
+            logger.debug(
+                "SENDING commit: accum=%d real_frames=%d pending=%s",
+                accum, real_frames, pending
+            )
+        elif t == "input_audio_buffer.append":
+            # keep logs concise; append is spammy, we log size separately elsewhere
+            pass
+        else:
+            logger.debug("SENDING to OpenAI: %s", t)
+
+        if openai_ws is None or openai_ws.closed:
+            logger.debug("OpenAI ws not ready/closed; drop %s", t)
+            return
+        await openai_ws.send_json(payload)
 
     async def openai_connect():
         nonlocal openai_session, openai_ws, pump_task, speaking, pending
@@ -99,8 +129,7 @@ async def browser_media_ws(ws: WebSocket):
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # Configure realtime session
-        await openai_ws.send_json({
+        await safe_send_json({
             "type": "session.update",
             "session": {
                 "input_audio_format": "pcm16",
@@ -134,9 +163,9 @@ async def browser_media_ws(ws: WebSocket):
                         elif et == "response.completed":
                             speaking = False
                             pending = False
-                            logger.debug("/browser-media response.completed (pending -> False)")
+                            logger.debug("OpenAI: response.completed (pending -> False)")
                         elif et == "error":
-                            logger.error("OpenAI error: %s", evt)
+                            logger.error("OpenAI error event: %s", evt)
                             pending = False
                             break
                     elif msg.type == WSMsgType.ERROR:
@@ -175,7 +204,7 @@ async def browser_media_ws(ws: WebSocket):
             ev = m.get("event")
 
             if ev == "start":
-                # reset counters and remote buffer
+                # Reset counters and clear any remote buffer (defensive)
                 try:
                     sr = int(m.get("sample_rate") or 16000)
                 except Exception:
@@ -185,61 +214,54 @@ async def browser_media_ws(ws: WebSocket):
                 real_frames = 0
                 pending = False
                 logger.info("/browser-media start sr=%d target=%d", sr, target)
-
-                if openai_ws and not openai_ws.closed:
-                    await openai_ws.send_json({"type": "input_audio_buffer.clear"})
-                    logger.debug("/browser-media cleared remote buffer")
+                await safe_send_json({"type": "input_audio_buffer.clear"})
+                logger.debug("remote input buffer cleared")
 
             elif ev == "media":
                 if openai_ws is None or openai_ws.closed:
-                    logger.debug("/browser-media: openai_ws not ready/closed; dropping frame")
+                    logger.debug("drop frame: OpenAI ws not ready/closed")
                     continue
 
                 b64 = m.get("audio")
                 if not b64:
-                    logger.debug("/browser-media: empty b64; dropping frame")
+                    logger.debug("drop frame: empty base64")
                     continue
 
-                # Measure first; if zero, do not append & do not count
+                # Measure first; append only if >0
                 try:
                     blen = len(base64.b64decode(b64))
                 except Exception:
                     blen = 0
 
                 if blen == 0:
-                    logger.debug("/browser-media frame bytes=0 (ignored)")
+                    logger.debug("frame bytes=0 (ignored)")
                     continue
 
-                # OPTIONAL: hard barge-in if user speaks while bot is talking
+                # OPTIONAL hard barge-in
                 # if speaking:
-                #     await openai_ws.send_json({"type": "response.cancel"})
+                #     await safe_send_json({"type": "response.cancel"})
                 #     speaking = False
-                #     logger.debug("/browser-media response.cancel on barge-in")
+                #     logger.debug("barge-in: response.cancel sent")
 
-                # Only now append (we know it's a non-empty frame)
-                await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": b64})
+                # Append & update counters
+                await safe_send_json({"type": "input_audio_buffer.append", "audio": b64})
                 accum += blen
                 real_frames += 1
-                logger.debug("/browser-media frame bytes=%d, accum=%d, frames=%d, target=%d, pending=%s",
+                logger.debug("frame bytes=%d, accum=%d, frames=%d, target=%d, pending=%s",
                              blen, accum, real_frames, target, pending)
 
-                # Strict commit gate:
-                #  - at least 2 real frames (avoid micro-commits)
-                #  - accumulated >= target (~120ms)
-                #  - not already waiting for a reply
+                # Strict commit gate: >=2 frames, >=target, not pending
                 if (real_frames >= 2) and (accum >= target) and (not pending):
-                    logger.debug("/browser-media COMMIT accum=%d (frames=%d)", accum, real_frames)
                     pending = True
-                    # Commit & request response
-                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
-                    await openai_ws.send_json({
+                    await safe_send_json({"type": "input_audio_buffer.commit"})
+                    await safe_send_json({
                         "type": "response.create",
                         "response": {
                             "modalities": ["text", "audio"],
                             "instructions": "Reply in English only. Keep it short."
                         }
                     })
-                    # reset for next window
+                    logger.debug("commit sent (accum was %d). Resetting window.", accum)
                     accum = 0
                     real_frames = 0
 
