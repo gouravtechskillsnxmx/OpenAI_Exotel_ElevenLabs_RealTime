@@ -75,16 +75,15 @@ async def browser_media_ws(ws: WebSocket):
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing /browser-media")
-        await ws.close()
-        return
+        await ws.close();  return
 
-    # Stream state
-    stream_sr = 16000             # browser sends this in the first "start" event
-    bytes_per_sample = 2          # PCM16 mono
-    commit_target = int(stream_sr * bytes_per_sample * 0.12)  # ~120ms
+    # --- stream / buffer state ---
+    stream_sr = 16000                  # browser announces in the first "start"
+    BYTES_PER_SAMPLE = 2               # PCM16 mono
+    commit_target = int(stream_sr * BYTES_PER_SAMPLE * 0.12)   # ~120 ms
     accum_bytes = 0
-    had_audio = False             # -> only commit if we've actually buffered audio
-    speaking = False              # for optional hard barge-in
+    buffered_any = False               # becomes True only after we append >0 real bytes
+    speaking = False
 
     openai_session: Optional[ClientSession] = None
     openai_ws = None
@@ -98,7 +97,7 @@ async def browser_media_ws(ws: WebSocket):
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # Configure the realtime session for PCM16 + English
+        # Configure realtime session (PCM16 both ways; English only)
         await openai_ws.send_json({
             "type": "session.update",
             "session": {
@@ -118,22 +117,21 @@ async def browser_media_ws(ws: WebSocket):
             }
         })
 
-        # Pump OpenAI -> Browser (PCM16 base64)
-        async def pump():
+        async def pump_openai_to_browser():
             nonlocal speaking
             try:
                 async for msg in openai_ws:
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
-                        t = evt.get("type")
-                        if t == "response.audio.delta":
+                        et = evt.get("type")
+                        if et == "response.audio.delta":
                             chunk_b64 = evt.get("delta")
                             if chunk_b64 and ws.client_state.name != "DISCONNECTED":
                                 speaking = True
                                 await ws.send_text(json.dumps({"event": "media", "audio": chunk_b64}))
-                        elif t == "response.completed":
+                        elif et == "response.completed":
                             speaking = False
-                        elif t == "error":
+                        elif et == "error":
                             logger.error("OpenAI error: %s", evt)
                             break
                     elif msg.type == WSMsgType.ERROR:
@@ -142,7 +140,7 @@ async def browser_media_ws(ws: WebSocket):
             except Exception as e:
                 logger.exception("OpenAI pump error: %s", e)
 
-        pump_task = asyncio.create_task(pump())
+        pump_task = asyncio.create_task(pump_openai_to_browser())
 
     async def openai_close():
         try:
@@ -161,7 +159,6 @@ async def browser_media_ws(ws: WebSocket):
         except Exception:
             pass
 
-    # Connect to OpenAI now that client WS is accepted
     await openai_connect()
 
     try:
@@ -171,41 +168,46 @@ async def browser_media_ws(ws: WebSocket):
             ev = m.get("event")
 
             if ev == "start":
-                # Browser announces sample rate; compute commit size (~120ms)
+                # Announce sample-rate and reset all local/remote buffers
                 try:
                     stream_sr = int(m.get("sample_rate") or 16000)
                 except Exception:
                     stream_sr = 16000
-                commit_target = int(stream_sr * bytes_per_sample * 0.12)
+                commit_target = int(stream_sr * BYTES_PER_SAMPLE * 0.12)  # ~120 ms
                 accum_bytes = 0
-                had_audio = False
+                buffered_any = False
                 logger.info("/browser-media start sr=%d target=%d", stream_sr, commit_target)
+
+                # Clear any residual server buffer (defensive)
+                if openai_ws and not openai_ws.closed:
+                    await openai_ws.send_json({"type": "input_audio_buffer.clear"})
 
             elif ev == "media":
                 b64 = m.get("audio")
                 if not b64 or openai_ws is None or openai_ws.closed:
                     continue
 
-                # OPTIONAL hard barge-in (uncomment to force-cut bot when user speaks)
+                # OPTIONAL barge-in (force-cut bot once user speaks)
                 # if speaking:
                 #     await openai_ws.send_json({"type": "response.cancel"})
                 #     speaking = False
 
-                # Append audio to OpenAI buffer
+                # Append and measure this chunk
                 await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": b64})
-
-                # Track how much audio we actually buffered
                 try:
                     raw_len = len(base64.b64decode(b64))
                 except Exception:
                     raw_len = 0
 
+                logger.debug("/browser-media frame bytes=%d", raw_len)
+
                 if raw_len > 0:
-                    had_audio = True
+                    buffered_any = True
                     accum_bytes += raw_len
 
-                # Commit only after we've really buffered >= ~100–120ms
-                if had_audio and accum_bytes >= commit_target:
+                # Commit strictly only after real audio ≥ target
+                if buffered_any and accum_bytes >= commit_target:
+                    logger.debug("/browser-media committing bytes=%d (target=%d)", accum_bytes, commit_target)
                     await openai_ws.send_json({"type": "input_audio_buffer.commit"})
                     await openai_ws.send_json({
                         "type": "response.create",
@@ -215,7 +217,7 @@ async def browser_media_ws(ws: WebSocket):
                         }
                     })
                     accum_bytes = 0
-                    had_audio = False
+                    buffered_any = False
 
             else:
                 # ignore unknown events
