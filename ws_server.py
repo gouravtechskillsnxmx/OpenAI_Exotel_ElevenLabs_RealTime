@@ -75,29 +75,31 @@ async def browser_media_ws(ws: WebSocket):
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing /browser-media")
-        await ws.close();  return
+        await ws.close()
+        return
 
-    # --- stream / buffer state ---
-    stream_sr = 16000                  # browser announces in the first "start"
-    BYTES_PER_SAMPLE = 2               # PCM16 mono
-    commit_target = int(stream_sr * BYTES_PER_SAMPLE * 0.12)   # ~120 ms
-    accum_bytes = 0
-    buffered_any = False               # becomes True only after we append >0 real bytes
-    speaking = False
+    # ---- stream state ----
+    sr = 16000                     # browser tells us on "start"
+    BYTES_PER_SAMPLE = 2           # PCM16 mono
+    target = int(sr * BYTES_PER_SAMPLE * 0.12)  # ~120ms
+    accum = 0
+    real_frames = 0                # number of non-zero frames in current window
+    pending = False                # we asked for a response and are waiting
+    speaking = False               # model is currently speaking
 
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
 
     async def openai_connect():
-        nonlocal openai_session, openai_ws, pump_task, speaking
+        nonlocal openai_session, openai_ws, pump_task, speaking, pending
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
 
-        # Configure realtime session (PCM16 both ways; English only)
+        # Configure realtime session
         await openai_ws.send_json({
             "type": "session.update",
             "session": {
@@ -118,27 +120,32 @@ async def browser_media_ws(ws: WebSocket):
         })
 
         async def pump_openai_to_browser():
-            nonlocal speaking
+            nonlocal speaking, pending
             try:
                 async for msg in openai_ws:
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
                         et = evt.get("type")
                         if et == "response.audio.delta":
-                            chunk_b64 = evt.get("delta")
-                            if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                            chunk = evt.get("delta")
+                            if chunk and ws.client_state.name != "DISCONNECTED":
                                 speaking = True
-                                await ws.send_text(json.dumps({"event": "media", "audio": chunk_b64}))
+                                await ws.send_text(json.dumps({"event": "media", "audio": chunk}))
                         elif et == "response.completed":
                             speaking = False
+                            pending = False
+                            logger.debug("/browser-media response.completed (pending -> False)")
                         elif et == "error":
                             logger.error("OpenAI error: %s", evt)
+                            pending = False
                             break
                     elif msg.type == WSMsgType.ERROR:
                         logger.error("OpenAI ws error")
+                        pending = False
                         break
             except Exception as e:
                 logger.exception("OpenAI pump error: %s", e)
+                pending = False
 
         pump_task = asyncio.create_task(pump_openai_to_browser())
 
@@ -168,46 +175,62 @@ async def browser_media_ws(ws: WebSocket):
             ev = m.get("event")
 
             if ev == "start":
-                # Announce sample-rate and reset all local/remote buffers
+                # reset counters and remote buffer
                 try:
-                    stream_sr = int(m.get("sample_rate") or 16000)
+                    sr = int(m.get("sample_rate") or 16000)
                 except Exception:
-                    stream_sr = 16000
-                commit_target = int(stream_sr * BYTES_PER_SAMPLE * 0.12)  # ~120 ms
-                accum_bytes = 0
-                buffered_any = False
-                logger.info("/browser-media start sr=%d target=%d", stream_sr, commit_target)
+                    sr = 16000
+                target = int(sr * BYTES_PER_SAMPLE * 0.12)
+                accum = 0
+                real_frames = 0
+                pending = False
+                logger.info("/browser-media start sr=%d target=%d", sr, target)
 
-                # Clear any residual server buffer (defensive)
                 if openai_ws and not openai_ws.closed:
                     await openai_ws.send_json({"type": "input_audio_buffer.clear"})
+                    logger.debug("/browser-media cleared remote buffer")
 
             elif ev == "media":
-                b64 = m.get("audio")
-                if not b64 or openai_ws is None or openai_ws.closed:
+                if openai_ws is None or openai_ws.closed:
+                    logger.debug("/browser-media: openai_ws not ready/closed; dropping frame")
                     continue
 
-                # OPTIONAL barge-in (force-cut bot once user speaks)
+                b64 = m.get("audio")
+                if not b64:
+                    logger.debug("/browser-media: empty b64; dropping frame")
+                    continue
+
+                # Measure first; if zero, do not append & do not count
+                try:
+                    blen = len(base64.b64decode(b64))
+                except Exception:
+                    blen = 0
+
+                if blen == 0:
+                    logger.debug("/browser-media frame bytes=0 (ignored)")
+                    continue
+
+                # OPTIONAL: hard barge-in if user speaks while bot is talking
                 # if speaking:
                 #     await openai_ws.send_json({"type": "response.cancel"})
                 #     speaking = False
+                #     logger.debug("/browser-media response.cancel on barge-in")
 
-                # Append and measure this chunk
+                # Only now append (we know it's a non-empty frame)
                 await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": b64})
-                try:
-                    raw_len = len(base64.b64decode(b64))
-                except Exception:
-                    raw_len = 0
+                accum += blen
+                real_frames += 1
+                logger.debug("/browser-media frame bytes=%d, accum=%d, frames=%d, target=%d, pending=%s",
+                             blen, accum, real_frames, target, pending)
 
-                logger.debug("/browser-media frame bytes=%d", raw_len)
-
-                if raw_len > 0:
-                    buffered_any = True
-                    accum_bytes += raw_len
-
-                # Commit strictly only after real audio ≥ target
-                if buffered_any and accum_bytes >= commit_target:
-                    logger.debug("/browser-media committing bytes=%d (target=%d)", accum_bytes, commit_target)
+                # Strict commit gate:
+                #  - at least 2 real frames (avoid micro-commits)
+                #  - accumulated >= target (~120ms)
+                #  - not already waiting for a reply
+                if (real_frames >= 2) and (accum >= target) and (not pending):
+                    logger.debug("/browser-media COMMIT accum=%d (frames=%d)", accum, real_frames)
+                    pending = True
+                    # Commit & request response
                     await openai_ws.send_json({"type": "input_audio_buffer.commit"})
                     await openai_ws.send_json({
                         "type": "response.create",
@@ -216,8 +239,9 @@ async def browser_media_ws(ws: WebSocket):
                             "instructions": "Reply in English only. Keep it short."
                         }
                     })
-                    accum_bytes = 0
-                    buffered_any = False
+                    # reset for next window
+                    accum = 0
+                    real_frames = 0
 
             else:
                 # ignore unknown events
