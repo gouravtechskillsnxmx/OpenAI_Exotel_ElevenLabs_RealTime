@@ -71,25 +71,34 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 @app.websocket("/browser-media")
 async def browser_media_ws(ws: WebSocket):
     await ws.accept()
+    logger.info("/browser-media connected")
+
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing /browser-media")
-        await ws.close(); return
+        await ws.close()
+        return
 
-    stream_sr = 16000   # default; browser sends it in 'start'
-    bytes_per_sample = 2
+    # Stream state
+    stream_sr = 16000             # browser sends this in the first "start" event
+    bytes_per_sample = 2          # PCM16 mono
     commit_target = int(stream_sr * bytes_per_sample * 0.12)  # ~120ms
     accum_bytes = 0
-    speaking = False
+    had_audio = False             # -> only commit if we've actually buffered audio
+    speaking = False              # for optional hard barge-in
 
     openai_session: Optional[ClientSession] = None
     openai_ws = None
+    pump_task: Optional[asyncio.Task] = None
 
     async def openai_connect():
-        nonlocal openai_session, openai_ws
+        nonlocal openai_session, openai_ws, pump_task, speaking
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
+
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
+
+        # Configure the realtime session for PCM16 + English
         await openai_ws.send_json({
             "type": "session.update",
             "session": {
@@ -109,7 +118,38 @@ async def browser_media_ws(ws: WebSocket):
             }
         })
 
+        # Pump OpenAI -> Browser (PCM16 base64)
+        async def pump():
+            nonlocal speaking
+            try:
+                async for msg in openai_ws:
+                    if msg.type == WSMsgType.TEXT:
+                        evt = msg.json()
+                        t = evt.get("type")
+                        if t == "response.audio.delta":
+                            chunk_b64 = evt.get("delta")
+                            if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                                speaking = True
+                                await ws.send_text(json.dumps({"event": "media", "audio": chunk_b64}))
+                        elif t == "response.completed":
+                            speaking = False
+                        elif t == "error":
+                            logger.error("OpenAI error: %s", evt)
+                            break
+                    elif msg.type == WSMsgType.ERROR:
+                        logger.error("OpenAI ws error")
+                        break
+            except Exception as e:
+                logger.exception("OpenAI pump error: %s", e)
+
+        pump_task = asyncio.create_task(pump())
+
     async def openai_close():
+        try:
+            if pump_task and not pump_task.done():
+                pump_task.cancel()
+        except Exception:
+            pass
         try:
             if openai_ws and not openai_ws.closed:
                 await openai_ws.close()
@@ -121,83 +161,71 @@ async def browser_media_ws(ws: WebSocket):
         except Exception:
             pass
 
-    async def pump_openai_to_browser():
-        nonlocal speaking
-        try:
-            async for msg in openai_ws:
-                if msg.type == WSMsgType.TEXT:
-                    evt = msg.json()
-                    t = evt.get("type")
-                    if t == "response.audio.delta":
-                        speaking = True
-                        chunk_b64 = evt.get("delta")
-                        if chunk_b64 and ws.client_state.name != "DISCONNECTED":
-                            await ws.send_text(json.dumps({"event": "media", "audio": chunk_b64}))
-                    elif t == "response.completed":
-                        speaking = False
-                    elif t == "error":
-                        logger.error("OpenAI error: %s", evt); break
-                elif msg.type == WSMsgType.ERROR:
-                    logger.error("OpenAI ws error"); break
-        except Exception as e:
-            logger.exception("OpenAI pump error: %s", e)
-
+    # Connect to OpenAI now that client WS is accepted
     await openai_connect()
-    pump_task = asyncio.create_task(pump_openai_to_browser())
 
     try:
         while True:
             raw = await ws.receive_text()
             m = json.loads(raw)
-            if m.get("event") == "start":
+            ev = m.get("event")
+
+            if ev == "start":
+                # Browser announces sample rate; compute commit size (~120ms)
                 try:
                     stream_sr = int(m.get("sample_rate") or 16000)
                 except Exception:
                     stream_sr = 16000
                 commit_target = int(stream_sr * bytes_per_sample * 0.12)
                 accum_bytes = 0
+                had_audio = False
                 logger.info("/browser-media start sr=%d target=%d", stream_sr, commit_target)
 
-            elif m.get("event") == "media":
+            elif ev == "media":
                 b64 = m.get("audio")
                 if not b64 or openai_ws is None or openai_ws.closed:
                     continue
 
-                # OPTIONAL hard barge-in
+                # OPTIONAL hard barge-in (uncomment to force-cut bot when user speaks)
                 # if speaking:
                 #     await openai_ws.send_json({"type": "response.cancel"})
                 #     speaking = False
 
+                # Append audio to OpenAI buffer
                 await openai_ws.send_json({"type": "input_audio_buffer.append", "audio": b64})
 
+                # Track how much audio we actually buffered
                 try:
                     raw_len = len(base64.b64decode(b64))
                 except Exception:
                     raw_len = 0
-                accum_bytes += raw_len
 
-                if accum_bytes >= commit_target:
+                if raw_len > 0:
+                    had_audio = True
+                    accum_bytes += raw_len
+
+                # Commit only after we've really buffered >= ~100–120ms
+                if had_audio and accum_bytes >= commit_target:
                     await openai_ws.send_json({"type": "input_audio_buffer.commit"})
                     await openai_ws.send_json({
                         "type": "response.create",
                         "response": {
-                            "modalities": ["text","audio"],
+                            "modalities": ["text", "audio"],
                             "instructions": "Reply in English only. Keep it short."
                         }
                     })
                     accum_bytes = 0
+                    had_audio = False
+
             else:
                 # ignore unknown events
                 pass
+
     except WebSocketDisconnect:
         logger.info("/browser-media disconnected")
     except Exception as e:
         logger.exception("/browser-media error: %s", e)
     finally:
-        try:
-            pump_task.cancel()
-        except Exception:
-            pass
         await openai_close()
         try:
             await ws.close()
