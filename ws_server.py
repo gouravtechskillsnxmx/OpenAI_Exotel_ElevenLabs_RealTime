@@ -71,11 +71,12 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 @app.websocket("/browser-media")
 async def browser_media_ws(ws: WebSocket):
     """
-    Browser softphone WS with robust barge-in & zero-empty-commit guarantee:
+    Browser softphone WS with robust barge-in & strict commit ordering:
       - Lazy-connects to OpenAI after first non-zero mic frame
-      - While model is speaking (pending/speaking), buffers mic audio
-      - When buffered >= ~120ms: cancel once, append->(yield)->commit->response.create
-      - Never sends a commit unless audio has actually been appended since last commit/clear
+      - While model is speaking, buffers mic audio
+      - On barge-in: cancel -> append -> yield -> commit (non-force) -> response.create -> pending=True
+      - Never set pending=True before a successful commit+response.create
+      - Never send commit unless audio has been appended since the last commit/clear
     """
     await ws.accept()
     logger.info("/browser-media connected")
@@ -85,16 +86,16 @@ async def browser_media_ws(ws: WebSocket):
         await ws.close()
         return
 
-    # ---- browser stream state ----
+    # ---- stream state ----
     sr = 16000
     BYTES_PER_SAMPLE = 2
-    target = int(sr * BYTES_PER_SAMPLE * 0.12)  # ~120ms window at 16k/mono/PCM16
+    target = int(sr * BYTES_PER_SAMPLE * 0.12)  # ≈120 ms at 16 kHz mono PCM16
 
     # live window (when model is idle)
     accum = 0
     real_frames = 0
 
-    pending = False               # True while a response is in-flight / bot is speaking
+    pending = False               # True only after commit+response.create are sent
     speaking = False
 
     # barge-in buffer (mic audio captured while pending/speaking)
@@ -103,7 +104,7 @@ async def browser_media_ws(ws: WebSocket):
     buffered_frames = 0
     cancel_sent_for_buffer = False  # ensure we cancel only once per buffered turn
 
-    # IMPORTANT: tracks if we've appended any audio since the last commit/clear
+    # tracks if we've appended any audio since last commit/clear
     buffer_has_audio = False
 
     # OpenAI (lazy)
@@ -112,11 +113,8 @@ async def browser_media_ws(ws: WebSocket):
     pump_task: Optional[asyncio.Task] = None
     connected_to_openai = False
 
-    async def safe_send_json(payload: dict, *, force: bool = False):
-        """
-        Single choke point for sending to OpenAI, with guards and visibility.
-        Ensures we never commit unless audio has been appended since the last commit/clear.
-        """
+    async def safe_send_json(payload: dict):
+        """Single choke point for sending to OpenAI with guards and visibility."""
         nonlocal accum, real_frames, pending, buffer_has_audio
         t = payload.get("type")
         if openai_ws is None or openai_ws.closed:
@@ -128,23 +126,24 @@ async def browser_media_ws(ws: WebSocket):
             if not buffer_has_audio:
                 logger.info("BLOCKED commit: buffer_has_audio=False (no appended audio since last commit)")
                 return
-            if not force:
-                if real_frames < 2 or accum <= 0 or pending:
-                    logger.info("BLOCKED commit: accum=%d frames=%d pending=%s", accum, real_frames, pending)
-                    return
-            logger.info("SENDING commit (force=%s): accum=%d frames=%d pending=%s",
-                        force, accum, real_frames, pending)
+            # Normal guard: require real window and NOT pending
+            if real_frames < 2 or accum <= 0 or pending:
+                logger.info("BLOCKED commit: accum=%d frames=%d pending=%s", accum, real_frames, pending)
+                return
+            logger.info("SENDING commit: accum=%d frames=%d pending=%s", accum, real_frames, pending)
 
+        elif t == "input_audio_buffer.append":
+            # quiet; we log sizes elsewhere
+            pass
         elif t == "input_audio_buffer.clear":
             buffer_has_audio = False
             logger.info("SENDING to OpenAI: input_audio_buffer.clear")
-
-        elif t != "input_audio_buffer.append":
+        else:
             logger.info("SENDING to OpenAI: %s", t)
 
         await openai_ws.send_json(payload)
 
-        # After a successful commit, the server-side input buffer is empty again
+        # After a successful commit, remote input buffer empties
         if t == "input_audio_buffer.commit":
             buffer_has_audio = False
 
@@ -196,8 +195,8 @@ async def browser_media_ws(ws: WebSocket):
 
                         elif et == "response.completed":
                             speaking = False
-                            pending = False
-                            cancel_sent_for_buffer = False   # next overlap can cancel again
+                            pending = False                    # response finished
+                            cancel_sent_for_buffer = False     # next overlap can cancel again
                             logger.info("OpenAI: response.completed (pending -> False)")
 
                         elif et == "error":
@@ -294,19 +293,24 @@ async def browser_media_ws(ws: WebSocket):
                                     "(frames=%d bytes=%d)", buffered_frames, buffered_bytes)
 
                         # 1) cancel current response
-                        await safe_send_json({"type": "response.cancel"}, force=True)
+                        await safe_send_json({"type": "response.cancel"})
+                        pending = False
+                        speaking = False
 
                         # 2) append all buffered frames
                         for buf in buffered_chunks:
                             await safe_send_json({"type": "input_audio_buffer.append", "audio": buf})
-                        buffer_has_audio = True  # audio appended since last commit/clear
+                        buffer_has_audio = True
 
-                        # 3) tiny yield so appends flush to socket before commit
+                        # 3) set window counters to buffered values (so non-force commit passes)
+                        accum = buffered_bytes
+                        real_frames = buffered_frames
+
+                        # 4) tiny yield so appends flush to socket before commit
                         await asyncio.sleep(0)
 
-                        # 4) commit + ask for reply (force allowed during overlap)
-                        pending = True
-                        await safe_send_json({"type": "input_audio_buffer.commit"}, force=True)
+                        # 5) commit + ask for reply (non-force), THEN mark pending=True
+                        await safe_send_json({"type": "input_audio_buffer.commit"})
                         await safe_send_json({
                             "type": "response.create",
                             "response": {
@@ -314,12 +318,15 @@ async def browser_media_ws(ws: WebSocket):
                                 "instructions": "Reply in English only. Keep it short."
                             }
                         })
+                        pending = True
                         logger.info("barge-in: committed buffered turn.")
 
-                        # 5) reset buffer for next overlaps
+                        # 6) reset buffer and live window counters
                         buffered_chunks.clear()
                         buffered_bytes = buffered_frames = 0
-                        cancel_sent_for_buffer = False  # allow cancel for a future overlap
+                        accum = 0
+                        real_frames = 0
+                        cancel_sent_for_buffer = False
                     continue  # do not feed live window while pending
 
                 # Normal path: model idle → append/accumulate live window
@@ -330,8 +337,8 @@ async def browser_media_ws(ws: WebSocket):
                 logger.info("frame bytes=%d, accum=%d, frames=%d, target=%d, pending=%s",
                             blen, accum, real_frames, target, pending)
 
+                # Commit only after ≥2 frames, ≥target bytes, and NOT pending
                 if (real_frames >= 2) and (accum >= target) and (not pending):
-                    pending = True
                     await safe_send_json({"type": "input_audio_buffer.commit"})
                     await safe_send_json({
                         "type": "response.create",
@@ -340,6 +347,7 @@ async def browser_media_ws(ws: WebSocket):
                             "instructions": "Reply in English only. Keep it short."
                         }
                     })
+                    pending = True
                     logger.info("commit sent (accum was %d). Resetting window.", accum)
                     accum = 0
                     real_frames = 0
@@ -358,6 +366,7 @@ async def browser_media_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+
 #------------------------------------------------------------
 
 
