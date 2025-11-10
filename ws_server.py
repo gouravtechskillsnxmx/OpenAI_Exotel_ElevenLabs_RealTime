@@ -241,23 +241,33 @@ async def browser_media_ws(ws: WebSocket):
             pass
         connected_to_openai = False
     async def send_turn_from_chunks(chunks: list[str]):
-        """Send one response.create turn with inline input_audio from the provided base64 chunks."""
+        
+        """Append audio chunks to buffer, commit, then request response."""
         nonlocal pending
+
         if not chunks:
             return
+        # Append each chunk to buffer
+        for c in chunks:
+            await send_openai({
+                "type": "input_audio_buffer.append",
+                "audio": c
+            })
+
+        # Commit the buffer
+        await send_openai({"type": "input_audio_buffer.commit"})
+
+        # Request response
         await send_openai({
             "type": "response.create",
-            # ⬇️ input_audio must be TOP-LEVEL (sibling of "response"), not nested inside it
-            "input_audio": [{"audio": c, "format": "pcm16"} for c in chunks],
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": "Reply in English only. Keep it short."
             }
         })
+
         pending = True
         logger.info("turn sent: chunks=%d", len(chunks))
-
-
     try:
         while True:
             raw = await ws.receive_text()
