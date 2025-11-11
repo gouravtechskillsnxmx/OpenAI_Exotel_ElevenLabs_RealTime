@@ -14,4 +14,6 @@ redis
 python-dotenv
 python-multipart
 flask
+numpy
+
 
