@@ -143,7 +143,7 @@ async def browser_media_ws(ws: WebSocket):
             "session": {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": null,  # Manual control to avoid auto-commit conflicts
+                "turn_detection": None,  # Manual control to avoid auto-commit conflicts
                 "voice": "verse",
                 "instructions": (
                     "You are a concise helpful voice agent. "
