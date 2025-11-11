@@ -31,6 +31,8 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from aiohttp import ClientSession, WSMsgType
+import numpy as np
+from scipy.signal import resample
 
 # ---------- Logging ----------
 level = os.getenv("LOG_LEVEL", "INFO").upper()
