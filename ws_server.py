@@ -73,11 +73,12 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 @app.websocket("/browser-media")
 async def browser_media_ws(ws: WebSocket):
     """
-    Browser softphone WS (no input_audio_buffer.*):
-      - Lazy-connects to OpenAI after first non-zero frame
-      - For each user turn, sends response.create with inline input_audio (base64 PCM16 chunks)
-      - Hard barge-in: response.cancel + immediate new response.create with buffered audio
-      - Never calls input_audio_buffer.append/commit → cannot trigger commit_empty
+    Browser softphone WS with manual turn detection:
+      - Disables server VAD for full client control.
+      - Accumulates chunks until silence timeout (user stopped speaking).
+      - Commits only if >=150ms accumulated to avoid empty/small buffer errors.
+      - Ignores silent frames via energy threshold.
+      - Hard barge-in during bot speech.
     """
     await ws.accept()
     logger.info("/browser-media connected")
@@ -92,20 +93,24 @@ async def browser_media_ws(ws: WebSocket):
     target_sr = 24000
     BYTES_PER_SAMPLE = 2
     MIN_TIME_S = 0.15  # Safe >100ms
-    MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * MIN_TIME_S)  # Adjusted
+    SILENCE_TIMEOUT_S = 0.6  # Detect end-of-turn
+    ENERGY_THRESHOLD = 100  # Min abs(sample) to consider non-silent (adjust as needed)
 
-    # Accumulators for the next user turn (when model idle)
+    # Accumulators for current user turn
     live_chunks: list[str] = []
     live_bytes = 0
     live_frames = 0
 
-    # Accumulators while bot is speaking (barge-in)
+    # Accumulators for barge-in
     barge_chunks: list[str] = []
     barge_bytes = 0
     barge_frames = 0
 
-    pending = False   # True while a response is in-flight / bot speaking
-    speaking = False  # set True while we receive audio deltas
+    pending = False  # True while a response is in-flight / bot speaking
+    speaking = False  # True while receiving audio deltas from OpenAI
+
+    # Silence detection timer
+    silence_timer: Optional[asyncio.Task] = None
 
     # OpenAI (lazy)
     openai_session: Optional[ClientSession] = None
@@ -120,7 +125,6 @@ async def browser_media_ws(ws: WebSocket):
         t = payload.get("type")
         if t != "response.audio.delta":
             logger.info("SENDING to OpenAI: %s", t)
-
         await openai_ws.send_json(payload)
 
     async def openai_connect():
@@ -139,12 +143,7 @@ async def browser_media_ws(ws: WebSocket):
             "session": {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 200,
-                    "silence_duration_ms": 600
-                },
+                "turn_detection": null,  # Manual control to avoid auto-commit conflicts
                 "voice": "verse",
                 "instructions": (
                     "You are a concise helpful voice agent. "
@@ -161,16 +160,16 @@ async def browser_media_ws(ws: WebSocket):
                         evt = msg.json()
                         et = evt.get("type")
 
-                        if et in ("response.output_audio.delta", "response.audio.delta"):
+                        if et == "response.audio.delta":
                             chunk = evt.get("delta")
                             if chunk and ws.client_state.name != "DISCONNECTED":
                                 speaking = True
                                 await ws.send_text(json.dumps({"event": "media", "audio": chunk}))
 
-                        elif et == "response.completed":
+                        elif et == "response.done":  # Use 'done' instead of 'completed' if API uses that
                             speaking = False
                             pending = False
-                            logger.info("OpenAI: response.completed (pending -> False)")
+                            logger.info("OpenAI: response.done (pending -> False)")
 
                         elif et == "error":
                             logger.error("OpenAI error event: %s", evt)
@@ -191,6 +190,8 @@ async def browser_media_ws(ws: WebSocket):
 
     async def openai_close():
         nonlocal connected_to_openai
+        if silence_timer:
+            silence_timer.cancel()
         try:
             if pump_task and not pump_task.done():
                 pump_task.cancel()
@@ -208,14 +209,27 @@ async def browser_media_ws(ws: WebSocket):
             pass
         connected_to_openai = False
 
-    async def send_turn_from_chunks(chunks: list[str]):
-        """Resample whole turn, append, commit, then request response."""
-        nonlocal pending
+    def reset_silence_timer():
+        nonlocal silence_timer
+        if silence_timer:
+            silence_timer.cancel()
+        silence_timer = asyncio.create_task(check_silence_timeout())
 
+    async def check_silence_timeout():
+        await asyncio.sleep(SILENCE_TIMEOUT_S)
+        # Flush if accumulated enough (not during barge/pending)
+        if not pending and not speaking and live_chunks:
+            logger.info("Silence timeout; flushing live buffer (frames=%d bytes=%d)", live_frames, live_bytes)
+            await send_turn_from_chunks(live_chunks)
+            live_chunks.clear()
+            live_bytes = live_frames = 0
+
+    async def send_turn_from_chunks(chunks: list[str]):
+        nonlocal pending
         if not chunks:
             return
 
-        # Concat samples from chunks
+        # Concat samples
         samples_list = []
         for c in chunks:
             audio_bytes = base64.b64decode(c)
@@ -234,7 +248,7 @@ async def browser_media_ws(ws: WebSocket):
         else:
             resampled = all_samples.astype(np.int16)
 
-        # Check min duration after resample (should match input time)
+        # Check min duration
         resampled_ms = (len(resampled) / target_sr) * 1000
         if resampled_ms < (MIN_TIME_S * 1000):
             logger.info("Skip commit: resampled %.2fms < %.2fms", resampled_ms, MIN_TIME_S * 1000)
@@ -242,16 +256,12 @@ async def browser_media_ws(ws: WebSocket):
 
         resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
 
-        # Append
+        # Append, commit, request response
         await send_openai({
             "type": "input_audio_buffer.append",
             "audio": resampled_b64
         })
-
-        # Commit
         await send_openai({"type": "input_audio_buffer.commit"})
-
-        # Request response
         await send_openai({
             "type": "response.create",
             "response": {
@@ -259,7 +269,6 @@ async def browser_media_ws(ws: WebSocket):
                 "instructions": "Reply in English only. Keep it short."
             }
         })
-
         pending = True
         logger.info("turn sent: chunks=%d resampled_ms=%.2f", len(chunks), resampled_ms)
 
@@ -274,11 +283,12 @@ async def browser_media_ws(ws: WebSocket):
                     sr = int(m.get("sample_rate") or 16000)
                 except Exception:
                     sr = 16000
-                MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * MIN_TIME_S)
                 live_chunks.clear(); live_bytes = live_frames = 0
                 barge_chunks.clear(); barge_bytes = barge_frames = 0
                 pending = speaking = False
-                logger.info("/browser-media start sr=%d min_window=%d", sr, MIN_WINDOW)
+                if silence_timer:
+                    silence_timer.cancel()
+                logger.info("/browser-media start sr=%d", sr)
 
             elif ev == "media":
                 b64 = m.get("audio")
@@ -288,7 +298,8 @@ async def browser_media_ws(ws: WebSocket):
 
                 # Validate bytes
                 try:
-                    blen = len(base64.b64decode(b64))
+                    audio_bytes = base64.b64decode(b64)
+                    blen = len(audio_bytes)
                 except Exception:
                     blen = 0
                 if blen == 0:
@@ -299,46 +310,49 @@ async def browser_media_ws(ws: WebSocket):
                 if not connected_to_openai:
                     await openai_connect()
 
-                # If model is speaking, accumulate for barge-in
+                # Energy check: ignore silent frames
+                samples = np.frombuffer(audio_bytes, dtype=np.int16)
+                if np.max(np.abs(samples)) < ENERGY_THRESHOLD:
+                    logger.info("Ignoring silent frame (max energy=%d < %d)", np.max(np.abs(samples)), ENERGY_THRESHOLD)
+                    continue
+
+                # Reset silence timer on non-silent frame
+                reset_silence_timer()
+
+                # If bot speaking/pending, accumulate for barge-in
                 if pending or speaking:
                     barge_chunks.append(b64)
                     barge_bytes += blen
                     barge_frames += 1
-                    logger.info("buffering while pending: +%d (total=%d, frames=%d)",
-                                blen, barge_bytes, barge_frames)
+                    logger.info("buffering barge: +%d (total=%d, frames=%d)", blen, barge_bytes, barge_frames)
 
-                    # Once we have enough, cancel and send new turn
-                    if barge_bytes >= MIN_WINDOW and barge_frames >= 2:
-                        logger.info("barge-in: cancel current TTS and send new turn "
-                                    "(frames=%d bytes=%d)", barge_frames, barge_bytes)
+                    # On enough for barge, cancel and flush
+                    if barge_bytes >= (target_sr * BYTES_PER_SAMPLE * MIN_TIME_S) and barge_frames >= 2:
+                        logger.info("Barge-in: cancel and send turn (frames=%d bytes=%d)", barge_frames, barge_bytes)
                         await send_openai({"type": "response.cancel"})
                         speaking = False
                         pending = False
-                        await asyncio.sleep(0)  # Yield for cancel
+                        await asyncio.sleep(0)  # Yield
                         await send_turn_from_chunks(barge_chunks)
                         barge_chunks.clear(); barge_bytes = barge_frames = 0
                     continue
 
-                # Model idle: accumulate live window
+                # Accumulate live
                 live_chunks.append(b64)
                 live_bytes += blen
                 live_frames += 1
-                logger.info("frame bytes=%d, live_bytes=%d, live_frames=%d, need>=%d",
-                            blen, live_bytes, live_frames, MIN_WINDOW)
-
-                if live_bytes >= MIN_WINDOW and live_frames >= 2 and not pending:
-                    await send_turn_from_chunks(live_chunks)
-                    live_chunks.clear(); live_bytes = live_frames = 0
+                logger.info("live frame: bytes=%d (total=%d, frames=%d)", blen, live_bytes, live_frames)
 
             else:
-                # ignore unknown events
-                pass
+                pass  # ignore unknown
 
     except WebSocketDisconnect:
         logger.info("/browser-media disconnected")
     except Exception as e:
         logger.exception("/browser-media error: %s", e)
     finally:
+        if silence_timer:
+            silence_timer.cancel()
         await openai_close()
         try:
             await ws.close()
@@ -405,11 +419,15 @@ async def exotel_media_ws(ws: WebSocket):
 
     # Stream state
     stream_sid: Optional[str] = None
-    sample_rate: int = 8000  # default; will be updated from "start"
+    sample_rate: int = 8000  # default; updated from "start"
+    target_sr: int = 24000  # OpenAI required
     bytes_per_sample: int = 2  # PCM16 mono
-    commit_target: int = int(sample_rate * bytes_per_sample * 0.12)  # ~120ms
-    accum_bytes: int = 0
-    speaking: bool = False  # for optional hard barge-in
+    min_commit_ms: float = 0.1  # OpenAI min 100ms
+    silence_duration_ms: float = 600  # Match session silence_duration_ms for force-commit
+
+    # For optional silence-based force commit
+    last_audio_time: float = 0.0
+    silence_check_task: Optional[asyncio.Task] = None
 
     openai_session: Optional[ClientSession] = None
     openai_ws = None
@@ -417,7 +435,7 @@ async def exotel_media_ws(ws: WebSocket):
 
     async def openai_connect():
         """Open the Realtime WS to OpenAI and configure the session for PCM16 + English."""
-        nonlocal openai_session, openai_ws, openai_reader_task, speaking
+        nonlocal openai_session, openai_ws, openai_reader_task
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
@@ -434,7 +452,7 @@ async def exotel_media_ws(ws: WebSocket):
                     "type": "server_vad",
                     "threshold": 0.5,
                     "prefix_padding_ms": 200,
-                    "silence_duration_ms": 600
+                    "silence_duration_ms": silence_duration_ms
                 },
                 "voice": "verse",
                 "instructions": (
@@ -466,6 +484,9 @@ async def exotel_media_ws(ws: WebSocket):
                         elif etype == "error":
                             logger.error("OpenAI error: %s", evt)
                             break
+                        # Optional: Handle speech_stopped to reset silence
+                        elif etype == "input_audio_buffer.speech_stopped":
+                            last_audio_time = asyncio.get_event_loop().time()
                     elif msg.type == WSMsgType.ERROR:
                         logger.error("OpenAI ws error")
                         break
@@ -476,6 +497,8 @@ async def exotel_media_ws(ws: WebSocket):
 
     async def openai_close():
         """Gracefully close OpenAI WS and session."""
+        if silence_check_task:
+            silence_check_task.cancel()
         try:
             if openai_reader_task and not openai_reader_task.done():
                 openai_reader_task.cancel()
@@ -495,6 +518,26 @@ async def exotel_media_ws(ws: WebSocket):
     # Connect to OpenAI once we have a client WS
     await openai_connect()
 
+    # Optional silence checker for force-commit/response
+    async def silence_checker():
+        while True:
+            await asyncio.sleep(0.1)
+            if asyncio.get_event_loop().time() - last_audio_time > (silence_duration_ms / 1000):
+                # Force commit if buffer has enough
+                await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                await openai_ws.send_json({
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "instructions": "Reply in English only. Keep it short."
+                    }
+                })
+                last_audio_time = asyncio.get_event_loop().time()  # Reset
+
+    silence_check_task = asyncio.create_task(silence_checker())
+
+    speaking: bool = False  # for optional hard barge-in
+
     try:
         while True:
             raw = await ws.receive_text()
@@ -502,22 +545,16 @@ async def exotel_media_ws(ws: WebSocket):
             etype = evt.get("event")
 
             if etype == "connected":
-                # Optional first event
                 continue
 
             if etype == "start":
-                # Exotel start event; also carries media_format
                 start_obj = evt.get("start", {})
                 stream_sid = start_obj.get("stream_sid") or start_obj.get("streamSid")
                 mf = start_obj.get("media_format") or {}
-                sr = int(mf.get("sample_rate") or sample_rate)
-                sample_rate = sr
-                commit_target = int(sample_rate * bytes_per_sample * 0.12)  # ~120ms buffer
-                accum_bytes = 0
-                logger.info("Exotel stream started sid=%s sr=%d commit_target=%d", stream_sid, sample_rate, commit_target)
+                sample_rate = int(mf.get("sample_rate") or sample_rate)
+                logger.info("Exotel stream started sid=%s sr=%d", stream_sid, sample_rate)
 
             elif etype == "media":
-                # Incoming PCM16 mono base64
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
                 if not payload_b64:
@@ -527,46 +564,54 @@ async def exotel_media_ws(ws: WebSocket):
                     logger.warning("OpenAI WS not ready; skipping audio frame")
                     continue
 
-                # OPTIONAL HARD BARGE-IN:
-                # If user speaks while bot is speaking, force-cancel current response
+                # Decode input audio
+                try:
+                    audio_bytes = base64.b64decode(payload_b64)
+                    if len(audio_bytes) == 0:
+                        continue
+                except Exception:
+                    logger.warning("Invalid base64 in media payload")
+                    continue
+
+                # Resample if needed
+                if sample_rate != target_sr:
+                    try:
+                        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                        resample_ratio = target_sr / sample_rate
+                        target_samples = int(len(samples) * resample_ratio)
+                        resampled = resample(samples, target_samples)
+                        resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+                        resampled_bytes = resampled.tobytes()
+                        resampled_b64 = base64.b64encode(resampled_bytes).decode('utf-8')
+                    except Exception as e:
+                        logger.error("Resample failed: %s", e)
+                        continue
+                else:
+                    resampled_b64 = payload_b64
+
+                # OPTIONAL HARD BARGE-IN (uncomment if needed)
                 # if speaking:
                 #     await openai_ws.send_json({"type": "response.cancel"})
                 #     speaking = False
 
-                # Append audio to OpenAI input buffer
+                # Append to OpenAI buffer
                 await openai_ws.send_json({
                     "type": "input_audio_buffer.append",
-                    "audio": payload_b64
+                    "audio": resampled_b64
                 })
 
-                # Count bytes and commit when reaching ~120ms
-                try:
-                    raw_len = len(base64.b64decode(payload_b64))
-                except Exception:
-                    raw_len = 0
-                accum_bytes += raw_len
+                # Update last audio time for silence detection
+                last_audio_time = asyncio.get_event_loop().time()
 
-                if accum_bytes >= commit_target:
-                    await openai_ws.send_json({"type": "input_audio_buffer.commit"})
-                    await openai_ws.send_json({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["text", "audio"],
-                            "instructions": "Reply in English only. Keep it short."
-                        }
-                    })
-                    logger.debug("[%s] committed %d bytes; requested response", stream_sid, accum_bytes)
-                    accum_bytes = 0
+                # No manual commit—let server VAD handle it
 
             elif etype == "dtmf":
-                # Optional: handle DTMF here if needed
                 pass
 
             elif etype == "stop":
                 logger.info("Exotel stream stopped sid=%s", stream_sid)
                 break
 
-            # Ignore unknown events quietly
     except WebSocketDisconnect:
         logger.info("Exotel WS disconnected")
     except Exception as e:
