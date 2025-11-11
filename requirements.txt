@@ -15,5 +15,7 @@ python-dotenv
 python-multipart
 flask
 numpy
+scipy.signal
+
 
 
