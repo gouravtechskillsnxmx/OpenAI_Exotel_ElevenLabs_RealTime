@@ -76,7 +76,6 @@ async def browser_media_ws(ws: WebSocket):
       - For each user turn, sends response.create with inline input_audio (base64 PCM16 chunks)
       - Hard barge-in: response.cancel + immediate new response.create with buffered audio
       - Never calls input_audio_buffer.append/commit → cannot trigger commit_empty
-																					
     """
     await ws.accept()
     logger.info("/browser-media connected")
@@ -88,8 +87,10 @@ async def browser_media_ws(ws: WebSocket):
 
     # ---- stream state ----
     sr = 16000
+    target_sr = 24000
     BYTES_PER_SAMPLE = 2
-    MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * 0.12)  # ~120ms @16k PCM16 = 3840 bytes
+    MIN_TIME_S = 0.15  # Safe >100ms
+    MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * MIN_TIME_S)  # Adjusted
 
     # Accumulators for the next user turn (when model idle)
     live_chunks: list[str] = []
@@ -103,12 +104,6 @@ async def browser_media_ws(ws: WebSocket):
 
     pending = False   # True while a response is in-flight / bot speaking
     speaking = False  # set True while we receive audio deltas
-					  
-					   
-																				  
-
-																
-							
 
     # OpenAI (lazy)
     openai_session: Optional[ClientSession] = None
@@ -117,41 +112,16 @@ async def browser_media_ws(ws: WebSocket):
     connected_to_openai = False
 
     async def send_openai(payload: dict):
-																				  
-															  
-							   
         if openai_ws is None or openai_ws.closed:
             logger.info("drop %s: OpenAI ws not ready/closed", payload.get("type"))
             return
         t = payload.get("type")
         if t != "response.audio.delta":
-																					   
-									
-																										   
-					  
-															   
-														
-																										 
-					  
-																									 
-
-											  
-										   
-				
-											 
-									
-																	  
-			 
             logger.info("SENDING to OpenAI: %s", t)
 
         await openai_ws.send_json(payload)
 
-																
-											
-									
-
     async def openai_connect():
-																					 
         nonlocal openai_session, openai_ws, pump_task, connected_to_openai, speaking, pending
         if connected_to_openai:
             return
@@ -189,7 +159,6 @@ async def browser_media_ws(ws: WebSocket):
                         evt = msg.json()
                         et = evt.get("type")
 
-                        # Some SDKs emit "response.output_audio.delta"; others "response.audio.delta"
                         if et in ("response.output_audio.delta", "response.audio.delta"):
                             chunk = evt.get("delta")
                             if chunk and ws.client_state.name != "DISCONNECTED":
@@ -199,24 +168,20 @@ async def browser_media_ws(ws: WebSocket):
                         elif et == "response.completed":
                             speaking = False
                             pending = False
-																							  
                             logger.info("OpenAI: response.completed (pending -> False)")
 
                         elif et == "error":
                             logger.error("OpenAI error event: %s", evt)
                             pending = False
-														  
                             break
 
                     elif msg.type == WSMsgType.ERROR:
                         logger.error("OpenAI ws error")
                         pending = False
-													  
                         break
             except Exception as e:
                 logger.exception("OpenAI pump error: %s", e)
                 pending = False
-											  
 
         pump_task = asyncio.create_task(pump_to_browser())
         connected_to_openai = True
@@ -240,21 +205,48 @@ async def browser_media_ws(ws: WebSocket):
         except Exception:
             pass
         connected_to_openai = False
+
     async def send_turn_from_chunks(chunks: list[str]):
-        
-        """Append audio chunks to buffer, commit, then request response."""
+        """Resample whole turn, append, commit, then request response."""
         nonlocal pending
 
         if not chunks:
             return
-        # Append each chunk to buffer
-        for c in chunks:
-            await send_openai({
-                "type": "input_audio_buffer.append",
-                "audio": c
-            })
 
-        # Commit the buffer
+        # Concat samples from chunks
+        samples_list = []
+        for c in chunks:
+            audio_bytes = base64.b64decode(c)
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+            samples_list.append(samples)
+        all_samples = np.concatenate(samples_list)
+
+        # Resample if needed
+        if sr != target_sr:
+            target_num = int(len(all_samples) * (target_sr / sr))
+            if target_num == 0:
+                logger.info("Skip commit: resampled to 0 samples")
+                return
+            resampled = resample(all_samples, target_num)
+            resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+        else:
+            resampled = all_samples.astype(np.int16)
+
+        # Check min duration after resample (should match input time)
+        resampled_ms = (len(resampled) / target_sr) * 1000
+        if resampled_ms < (MIN_TIME_S * 1000):
+            logger.info("Skip commit: resampled %.2fms < %.2fms", resampled_ms, MIN_TIME_S * 1000)
+            return
+
+        resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
+
+        # Append
+        await send_openai({
+            "type": "input_audio_buffer.append",
+            "audio": resampled_b64
+        })
+
+        # Commit
         await send_openai({"type": "input_audio_buffer.commit"})
 
         # Request response
@@ -267,7 +259,8 @@ async def browser_media_ws(ws: WebSocket):
         })
 
         pending = True
-        logger.info("turn sent: chunks=%d", len(chunks))
+        logger.info("turn sent: chunks=%d resampled_ms=%.2f", len(chunks), resampled_ms)
+
     try:
         while True:
             raw = await ws.receive_text()
@@ -275,19 +268,14 @@ async def browser_media_ws(ws: WebSocket):
             ev = m.get("event")
 
             if ev == "start":
-																				
                 try:
                     sr = int(m.get("sample_rate") or 16000)
                 except Exception:
                     sr = 16000
-                MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * 0.12)
+                MIN_WINDOW = int(sr * BYTES_PER_SAMPLE * MIN_TIME_S)
                 live_chunks.clear(); live_bytes = live_frames = 0
                 barge_chunks.clear(); barge_bytes = barge_frames = 0
                 pending = speaking = False
-									   
-													
-											  
-										
                 logger.info("/browser-media start sr=%d min_window=%d", sr, MIN_WINDOW)
 
             elif ev == "media":
@@ -317,17 +305,14 @@ async def browser_media_ws(ws: WebSocket):
                     logger.info("buffering while pending: +%d (total=%d, frames=%d)",
                                 blen, barge_bytes, barge_frames)
 
-                    # Once we have ~120ms+, cancel and send a NEW turn immediately
+                    # Once we have enough, cancel and send new turn
                     if barge_bytes >= MIN_WINDOW and barge_frames >= 2:
-													 
                         logger.info("barge-in: cancel current TTS and send new turn "
                                     "(frames=%d bytes=%d)", barge_frames, barge_bytes)
-
-													
                         await send_openai({"type": "response.cancel"})
                         speaking = False
                         pending = False
-                        await asyncio.sleep(0)  # small yield so cancel applies
+                        await asyncio.sleep(0)  # Yield for cancel
                         await send_turn_from_chunks(barge_chunks)
                         barge_chunks.clear(); barge_bytes = barge_frames = 0
                     continue
@@ -343,52 +328,6 @@ async def browser_media_ws(ws: WebSocket):
                     await send_turn_from_chunks(live_chunks)
                     live_chunks.clear(); live_bytes = live_frames = 0
 
-																				
-											  
-
-																					   
-																				   
-											  
-													  
-										 
-																
-																					   
-							 
-						  
-									  
-																		 
-
-																  
-											   
-															
-								 
-									   
-													  
-																	 
-
-																		   
-																						 
-									   
-							 
-								
-																						 
-																	  
-
-																				 
-																			  
-																			   
-										  
-												  
-									 
-															
-																				   
-						 
-					  
-								  
-																					   
-							 
-								   
-
             else:
                 # ignore unknown events
                 pass
@@ -403,7 +342,6 @@ async def browser_media_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-
 #------------------------------------------------------------
 
 
