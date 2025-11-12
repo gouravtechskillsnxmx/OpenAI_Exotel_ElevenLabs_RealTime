@@ -69,6 +69,20 @@ logger = logging.getLogger("ws_server")
 
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
+#----------------------------------------------------
+import audioop
+import wave
+import time
+
+SAVE_TTS_WAV = os.getenv("SAVE_TTS_WAV", "0") == "1"
+
+def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
+    """24 kHz mono PCM16 → 8 kHz mono PCM16."""
+    converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
+    return converted
+
+#------------------------------------------
+
 # ---- add this new route ----
 @app.websocket("/browser-media")
 async def browser_media_ws(ws: WebSocket):
@@ -477,34 +491,57 @@ async def exotel_media_ws(ws: WebSocket):
 
         # Start a background task to forward OpenAI audio deltas back to Exotel
         async def pump_openai_to_exotel():
-            nonlocal speaking
-            try:
-                async for msg in openai_ws:
-                    if msg.type == WSMsgType.TEXT:
-                        evt = msg.json()
-                        etype = evt.get("type")
-                        if etype == "response.audio.delta":
-                            chunk_b64 = evt.get("delta")
-                            if chunk_b64 and ws.client_state.name != "DISCONNECTED":
-                                speaking = True
-                                await ws.send_text(json.dumps({
-                                    "event": "media",
-                                    "stream_sid": stream_sid,
-                                    "media": {"payload": chunk_b64}
-                                }))
-                        elif etype == "response.completed":
-                            speaking = False
-                        elif etype == "error":
-                            logger.error("OpenAI error: %s", evt)
-                            break
-                        # Optional: Handle speech_stopped to reset silence
-                        elif etype == "input_audio_buffer.speech_stopped":
-                            last_audio_time = asyncio.get_event_loop().time()
-                    elif msg.type == WSMsgType.ERROR:
-                        logger.error("OpenAI ws error")
-                        break
-            except Exception as e:
-                logger.exception("OpenAI pump error: %s", e)
+    nonlocal speaking
+    tts_dump: bytearray = bytearray()  # optional recorder
+
+    try:
+        async for msg in openai_ws:
+            if msg.type == WSMsgType.TEXT:
+                evt = msg.json()
+                etype = evt.get("type")
+
+                if etype == "response.audio.delta":
+                    chunk_b64 = evt.get("delta")
+                    if chunk_b64 and ws.client_state.name != "DISCONNECTED":
+                        # --- decode OpenAI 24k PCM16 ---
+                        pcm24 = base64.b64decode(chunk_b64)
+                        if SAVE_TTS_WAV:
+                            tts_dump.extend(pcm24)
+
+                        # --- downsample to 8k for Exotel ---
+                        pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                        out_b64 = base64.b64encode(pcm8).decode("ascii")
+
+                        # --- send to Exotel ---
+                        speaking = True
+                        await ws.send_text(json.dumps({
+                            "event": "media",
+                            "stream_sid": stream_sid,
+                            "media": {"payload": out_b64}
+                        }))
+
+                elif etype == "response.completed":
+                    speaking = False
+
+                elif etype == "error":
+                    logger.error("OpenAI error: %s", evt)
+                    break
+
+            elif msg.type == WSMsgType.ERROR:
+                logger.error("OpenAI ws error")
+                break
+    except Exception as e:
+        logger.exception("OpenAI pump error: %s", e)
+    finally:
+        # Save the voice output if requested
+        if SAVE_TTS_WAV and tts_dump:
+            fname = f"/tmp/openai_tts_{int(time.time())}.wav"
+            with wave.open(fname, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(bytes(tts_dump))
+            logger.info("Saved OpenAI TTS to %s", fname)
 
         openai_reader_task = asyncio.create_task(pump_openai_to_exotel())
 
