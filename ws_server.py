@@ -159,6 +159,7 @@ async def browser_media_ws(ws: WebSocket):
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
                         et = evt.get("type")
+                        logger.info(f"OpenAI → {et}")  # SEE EVERYTHING
 
                         if et == "response.audio.delta":
                             chunk = evt.get("delta")
@@ -166,22 +167,28 @@ async def browser_media_ws(ws: WebSocket):
                                 speaking = True
                                 await ws.send_text(json.dumps({"event": "media", "audio": chunk}))
 
-                        elif et == "response.done":  # Use 'done' instead of 'completed' if API uses that
+                        elif et == "response.audio.transcript.delta":
+                            print("User:", evt.get("delta", ""))
+
+                        elif et == "response.audio.done":
                             speaking = False
                             pending = False
-                            logger.info("OpenAI: response.done (pending -> False)")
+                            logger.info("Bot stopped speaking")
+
+                        elif et == "response.done":
+                            if not speaking:
+                                pending = False
 
                         elif et == "error":
-                            logger.error("OpenAI error event: %s", evt)
+                            logger.error("OpenAI ERROR: %s", evt)
                             pending = False
-                            break
 
                     elif msg.type == WSMsgType.ERROR:
-                        logger.error("OpenAI ws error")
+                        logger.error("OpenAI WS closed with error")
                         pending = False
                         break
             except Exception as e:
-                logger.exception("OpenAI pump error: %s", e)
+                logger.exception("pump_to_browser crashed: %s", e)
                 pending = False
 
         pump_task = asyncio.create_task(pump_to_browser())
@@ -265,7 +272,6 @@ async def browser_media_ws(ws: WebSocket):
         await send_openai({
             "type": "response.create",
             "response": {
-                "modalities": ["text", "audio"],
                 "instructions": "Reply in English only. Keep it short."
             }
         })
