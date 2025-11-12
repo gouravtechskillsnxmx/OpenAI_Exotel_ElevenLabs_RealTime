@@ -375,9 +375,25 @@ async def diag():
 # If you prefer to give Exotel an HTTPS endpoint that returns the WS URL:
 @app.get("/exotel-ws-bootstrap")
 async def exotel_ws_bootstrap():
-    if not PUBLIC_BASE_URL:
-        return JSONResponse({"error": "PUBLIC_BASE_URL not configured"}, status_code=500)
-    return {"url": f"wss://{PUBLIC_BASE_URL.split('://')[-1]}/exotel-media"}
+    """
+    Called by Exotel at the start of a call.
+    Must return JSON { "url": "wss://<your-host>/exotel-media" }.
+    """
+    try:
+        base = os.getenv("PUBLIC_BASE_URL", "").strip()
+        if not base:
+            # fallback: derive from Render env or request headers
+            base = "openai-exotel-elevenlabs-realtime.onrender.com"
+
+        # Build WSS URL for Exotel media stream
+        url = f"wss://{base}/exotel-media"
+
+        logger.info("Bootstrap served: %s", url)
+        return {"url": url}
+    except Exception as e:
+        logger.exception("/exotel-ws-bootstrap error: %s", e)
+        # Respond with a basic static URL so Exotel doesn't 500
+        return {"url": "wss://openai-exotel-elevenlabs-realtime.onrender.com/exotel-media"}
 
 # ======================================================================
 # ===============  EXOTEL BIDIRECTIONAL WS HANDLER  ====================
