@@ -159,36 +159,33 @@ async def browser_media_ws(ws: WebSocket):
                     if msg.type == WSMsgType.TEXT:
                         evt = msg.json()
                         et = evt.get("type")
-                        logger.info(f"OpenAI → {et}")  # SEE EVERYTHING
+                        logger.info(f"OpenAI EVENT: {et}")  # ← YOU WILL SEE THIS NOW
 
                         if et == "response.audio.delta":
                             chunk = evt.get("delta")
-                            if chunk and ws.client_state.name != "DISCONNECTED":
+                            if chunk:
                                 speaking = True
                                 await ws.send_text(json.dumps({"event": "media", "audio": chunk}))
-
-                        elif et == "response.audio.transcript.delta":
-                            print("User:", evt.get("delta", ""))
+                                logger.info("SENT AUDIO DELTA TO BROWSER")
 
                         elif et == "response.audio.done":
                             speaking = False
                             pending = False
-                            logger.info("Bot stopped speaking")
+                            logger.info("BOT FINISHED SPEAKING")
 
                         elif et == "response.done":
-                            if not speaking:
-                                pending = False
+                            pending = False
+                            logger.info("RESPONSE FULLY DONE")
 
                         elif et == "error":
-                            logger.error("OpenAI ERROR: %s", evt)
+                            logger.error("OPENAI ERROR: %s", evt)
                             pending = False
 
                     elif msg.type == WSMsgType.ERROR:
-                        logger.error("OpenAI WS closed with error")
+                        logger.error("OpenAI WS ERROR")
                         pending = False
-                        break
             except Exception as e:
-                logger.exception("pump_to_browser crashed: %s", e)
+                logger.exception("Pump crashed: %s", e)
                 pending = False
 
         pump_task = asyncio.create_task(pump_to_browser())
@@ -231,53 +228,47 @@ async def browser_media_ws(ws: WebSocket):
             live_chunks.clear()
             live_bytes = live_frames = 0
 
-    async def send_turn_from_chunks(chunks: list[str]):
-        nonlocal pending
-        if not chunks:
-            return
-
-        # Concat samples
-        samples_list = []
-        for c in chunks:
-            audio_bytes = base64.b64decode(c)
-            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-            samples_list.append(samples)
-        all_samples = np.concatenate(samples_list)
-
-        # Resample if needed
-        if sr != target_sr:
-            target_num = int(len(all_samples) * (target_sr / sr))
-            if target_num == 0:
-                logger.info("Skip commit: resampled to 0 samples")
+        async def send_turn_from_chunks(chunks: list[str]):
+            nonlocal pending
+            if not chunks:
                 return
-            resampled = resample(all_samples, target_num)
-            resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-        else:
-            resampled = all_samples.astype(np.int16)
 
-        # Check min duration
-        resampled_ms = (len(resampled) / target_sr) * 1000
-        if resampled_ms < (MIN_TIME_S * 1000):
-            logger.info("Skip commit: resampled %.2fms < %.2fms", resampled_ms, MIN_TIME_S * 1000)
-            return
+            # Concat samples
+            samples_list = []
+            for c in chunks:
+                audio_bytes = base64.b64decode(c)
+                samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                samples_list.append(samples)
+            all_samples = np.concatenate(samples_list)
 
-        resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
+            # Resample if needed
+            if sr != target_sr:
+                target_num = int(len(all_samples) * (target_sr / sr))
+                if target_num == 0:
+                    logger.info("Skip commit: resampled to 0 samples")
+                    return
+                resampled = resample(all_samples, target_num)
+                resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+            else:
+                resampled = all_samples.astype(np.int16)
 
-        # Append, commit, request response
-        await send_openai({
-            "type": "input_audio_buffer.append",
-            "audio": resampled_b64
-        })
-        await send_openai({"type": "input_audio_buffer.commit"})
-        await send_openai({
-            "type": "response.create",
-            "response": {
-                "instructions": "Reply in English only. Keep it short."
-            }
-        })
-        pending = True
-        logger.info("turn sent: chunks=%d resampled_ms=%.2f", len(chunks), resampled_ms)
+            # Check min duration
+            resampled_ms = (len(resampled) / target_sr) * 1000
+            if resampled_ms < (MIN_TIME_S * 1000):
+                logger.info("Skip commit: resampled %.2fms < %.2fms", resampled_ms, MIN_TIME_S * 1000)
+                return
 
+            resampled_b64 = base64.b64encode(resampled.tobytes()).decode('utf-8')
+
+            # === FIXED: Now we actually TELL OpenAI to respond! ===
+            await send_openai({
+                "type": "input_audio_buffer.append",
+                "audio": resampled_b64
+            })
+            await send_openai({"type": "input_audio_buffer.commit"})
+            await send_openai({"type": "response.create"})  # ← THIS WAS MISSING!!!
+            pending = True
+            logger.info("Turn committed + response.create sent! (%.2fms)", resampled_ms)
     try:
         while True:
             raw = await ws.receive_text()
